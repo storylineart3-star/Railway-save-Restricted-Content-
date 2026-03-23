@@ -172,7 +172,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📘 **GUIDE**\n\n"
         "1. Use /login to connect your Telegram account.\n"
-        "2. We only ask to login for private channel/groups content. you must be a member of private channel/group to save content.
+        "2. We only ask to login for private channel/groups content. you must be a member of private channel/group to save content.\n"
         "3. Send any public Telegram message link.\n\n"
         f"⚠️ **Limits:**\n"
         f"- Cooldown: {cooldown} seconds between requests\n"
