@@ -15,7 +15,12 @@ from telegram.ext import (
 )
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneNumberInvalidError,
+    PhoneNumberUnoccupiedError
+)
 
 # ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -208,31 +213,48 @@ async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return PHONE
 
 async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text
+    phone = update.message.text.strip()
+    if not re.match(r'^\+\d{7,15}$', phone):
+        await update.message.reply_text("❌ Invalid phone number. Please include country code, e.g., +919999999999")
+        return ConversationHandler.END
     context.user_data["phone"] = phone
 
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
-    await client.send_code_request(phone)
+    try:
+        await client.send_code_request(phone)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to send code: {str(e)}")
+        return ConversationHandler.END
 
     context.user_data["client"] = client
 
     await update.message.reply_text(
-        "🔢 Enter the OTP like: `1 2 3 4 5`\n(Spaces are required)",
+        "🔢 Enter the OTP like: `1 2 3 4 5`\n(Spaces are optional)",
         parse_mode="Markdown"
     )
     return CODE
 
 async def login_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = update.message.text.replace(" ", "")
+    if not code.isdigit():
+        await update.message.reply_text("❌ Invalid OTP. Please enter numbers only (with or without spaces).")
+        return ConversationHandler.END
+
     client = context.user_data["client"]
     user_id = update.effective_user.id
 
     try:
         await client.sign_in(context.user_data["phone"], code)
+    except PhoneCodeInvalidError:
+        await update.message.reply_text("❌ Invalid OTP. Please try again.")
+        return ConversationHandler.END
     except SessionPasswordNeededError:
         await update.message.reply_text("🔑 Enter your 2FA password:")
         return PASSWORD
+    except Exception as e:
+        await update.message.reply_text(f"❌ Login failed: {str(e)}")
+        return ConversationHandler.END
 
     session = client.session.save()
     await save_user_session(user_id, session)
@@ -241,10 +263,15 @@ async def login_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text
     client = context.user_data["client"]
     user_id = update.effective_user.id
 
-    await client.sign_in(password=update.message.text)
+    try:
+        await client.sign_in(password=password)
+    except Exception as e:
+        await update.message.reply_text(f"❌ 2FA login failed: {str(e)}")
+        return ConversationHandler.END
 
     session = client.session.save()
     await save_user_session(user_id, session)
@@ -441,7 +468,6 @@ async def set_autodelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== LINK HANDLER =====
 last_used = {}
-
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
@@ -537,9 +563,18 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await progress_msg.edit_text("📤 Uploading to cloud...")
                     try:
                         with open(file_path, 'rb') as f:
-                            response = requests.post('https://file.io', files={'file': f})
+                            headers = {
+                                'User-Agent': 'Mozilla/5.0 (compatible; TelegramBot/1.0)'
+                            }
+                            response = requests.post('https://file.io', files={'file': f}, headers=headers)
                         if response.status_code == 200:
-                            data = response.json()
+                            try:
+                                data = response.json()
+                            except ValueError:
+                                await progress_msg.edit_text(f"❌ Upload failed: Invalid response from file.io. Status: {response.status_code}\nResponse: {response.text[:200]}")
+                                await log_request(user_id, text, False, f"Upload failed: invalid JSON response")
+                                asyncio.create_task(delete_file_after(file_path, 60))
+                                return
                             link = data.get('link')
                             if link:
                                 await progress_msg.delete()
@@ -552,7 +587,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 auto_del = await get_auto_delete()
                                 asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id))
                                 return
-                        raise Exception("Upload failed")
+                            else:
+                                error_msg = data.get('error', 'Unknown error')
+                                await progress_msg.edit_text(f"❌ Upload failed: {error_msg}")
+                        else:
+                            await progress_msg.edit_text(f"❌ Upload failed: HTTP {response.status_code}")
+                        await log_request(user_id, text, False, f"Upload failed: HTTP {response.status_code}")
                     except Exception as e:
                         await progress_msg.edit_text(f"❌ Upload failed: {str(e)}")
                         await log_request(user_id, text, False, f"Upload failed: {str(e)}")
