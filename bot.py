@@ -441,7 +441,6 @@ async def set_autodelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== LINK HANDLER =====
 last_used = {}
-
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
@@ -519,4 +518,157 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if file_size:
                 size_mb = file_size / (1024 * 1024)
                 if size_mb > MAX_DOWNLOAD_MB:
-                
+                    await progress_msg.edit_text(
+                        f"❌ File too large ({size_mb:.1f} MB).\nMax allowed: {MAX_DOWNLOAD_MB} MB."
+                    )
+                    await log_request(user_id, text, False, f"File too large: {size_mb} MB")
+                    return
+                elif size_mb > MAX_FILE_MB:
+                    # Upload to file.io
+                    await progress_msg.edit_text(f"📥 Downloading large file ({size_mb:.1f} MB)...")
+                    async def download_progress(current, total):
+                        if total > 0:
+                            percent = int(current * 100 / total)
+                            await progress_msg.edit_text(f"📥 Downloading... {percent}%")
+                    file_path = await client.download_media(message, progress_callback=download_progress)
+                    await progress_msg.edit_text("📤 Uploading to cloud...")
+                    try:
+                        with open(file_path, 'rb') as f:
+                            response = requests.post('https://file.io', files={'file': f})
+                        if response.status_code == 200:
+                            data = response.json()
+                            link = data.get('link')
+                            if link:
+                                await progress_msg.delete()
+                                sent = await update.message.reply_text(
+                                    f"✅ File uploaded to cloud:\n{link}\n\n"
+                                    "⚠️ Note: The file will be deleted after first download or in 24 hours."
+                                )
+                                await log_request(user_id, text, True)
+                                asyncio.create_task(delete_file_after(file_path, 60))
+                                auto_del = await get_auto_delete()
+                                asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id))
+                                return
+                        raise Exception("Upload failed")
+                    except Exception as e:
+                        await progress_msg.edit_text(f"❌ Upload failed: {str(e)}")
+                        await log_request(user_id, text, False, f"Upload failed: {str(e)}")
+                        asyncio.create_task(delete_file_after(file_path, 60))
+                        return
+                else:
+                    # Normal download and send via bot
+                    await progress_msg.edit_text(f"📥 Downloading {size_mb:.1f} MB file...")
+                    async def download_progress(current, total):
+                        if total > 0:
+                            percent = int(current * 100 / total)
+                            await progress_msg.edit_text(f"📥 Downloading... {percent}%")
+                    file_path = await client.download_media(message, progress_callback=download_progress)
+                    await progress_msg.edit_text("📤 Uploading to Telegram...")
+                    with open(file_path, "rb") as f:
+                        if message.audio:
+                            sent = await update.message.reply_audio(f, caption=message.text if message.text else None)
+                        elif message.video:
+                            sent = await update.message.reply_video(f, caption=message.text if message.text else None)
+                        elif message.photo:
+                            sent = await update.message.reply_photo(f, caption=message.text if message.text else None)
+                        else:
+                            sent = await update.message.reply_document(f, caption=message.text if message.text else None)
+                    asyncio.create_task(delete_file_after(file_path, 60))
+                    auto_del = await get_auto_delete()
+                    asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id))
+                    await progress_msg.delete()
+                    await log_request(user_id, text, True)
+                    return
+            else:
+                # No file size info – download and send normally
+                file_path = await client.download_media(message)
+                await progress_msg.edit_text("📤 Uploading...")
+                with open(file_path, "rb") as f:
+                    if message.audio:
+                        sent = await update.message.reply_audio(f, caption=message.text if message.text else None)
+                    elif message.video:
+                        sent = await update.message.reply_video(f, caption=message.text if message.text else None)
+                    elif message.photo:
+                        sent = await update.message.reply_photo(f, caption=message.text if message.text else None)
+                    else:
+                        sent = await update.message.reply_document(f, caption=message.text if message.text else None)
+                asyncio.create_task(delete_file_after(file_path, 60))
+                auto_del = await get_auto_delete()
+                asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id))
+                await progress_msg.delete()
+                await log_request(user_id, text, True)
+                return
+    except Exception as e:
+        logger.exception("Error processing message")
+        await progress_msg.edit_text(f"❌ Error: {str(e)}")
+        await log_request(user_id, text, False, str(e))
+
+async def delete_file_after(file_path, delay):
+    await asyncio.sleep(delay)
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception:
+        pass
+
+async def auto_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: int):
+    await asyncio.sleep(await get_auto_delete())
+    try:
+        await context.bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass
+
+# ===== MAIN =====
+def main():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    loop.run_until_complete(init_db())
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # User commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("myinfo", myinfo))
+
+    # Login conversation
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("login", login_start)],
+        states={
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
+            CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_code)],
+            PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+    app.add_handler(conv)
+
+    # Admin commands
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("users", users_list))
+    app.add_handler(CommandHandler("user", user_details))
+    app.add_handler(CommandHandler("ban", ban_user))
+    app.add_handler(CommandHandler("unban", unban_user))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("setcooldown", set_cooldown))
+    app.add_handler(CommandHandler("setautodelete", set_autodelete))
+
+    # Link handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+
+    # Determine run mode
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if webhook_url:
+        port = int(os.environ.get("PORT", 8080))
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            webhook_url=f"{webhook_url}/{BOT_TOKEN}",
+            url_path=BOT_TOKEN
+        )
+    else:
+        app.run_polling()
+
+if __name__ == "__main__":
+    main()
