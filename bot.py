@@ -441,6 +441,7 @@ async def set_autodelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== LINK HANDLER =====
 last_used = {}
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
@@ -484,10 +485,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Resolve entity
     try:
         if chat_part.isdigit():
-            # Private channel: numeric ID (e.g., c/123456789)
             entity = await client.get_entity(int(f"-100{chat_part}"))
         else:
-            # Public channel: username
             entity = await client.get_entity(chat_part)
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to resolve channel: {str(e)}")
@@ -503,7 +502,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await log_request(user_id, text, False, "Message not found")
             return
 
-        # Text‑only message
+        # Text-only message
         if message.text and not message.media:
             await progress_msg.delete()
             sent = await update.message.reply_text(message.text)
@@ -526,10 +525,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 elif size_mb > MAX_FILE_MB:
                     # Upload to file.io
                     await progress_msg.edit_text(f"📥 Downloading large file ({size_mb:.1f} MB)...")
+                    last_percent = -1
                     async def download_progress(current, total):
+                        nonlocal last_percent
                         if total > 0:
                             percent = int(current * 100 / total)
-                            await progress_msg.edit_text(f"📥 Downloading... {percent}%")
+                            if percent != last_percent:
+                                last_percent = percent
+                                await progress_msg.edit_text(f"📥 Downloading... {percent}%")
                     file_path = await client.download_media(message, progress_callback=download_progress)
                     await progress_msg.edit_text("📤 Uploading to cloud...")
                     try:
@@ -558,10 +561,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     # Normal download and send via bot
                     await progress_msg.edit_text(f"📥 Downloading {size_mb:.1f} MB file...")
+                    last_percent = -1
                     async def download_progress(current, total):
+                        nonlocal last_percent
                         if total > 0:
                             percent = int(current * 100 / total)
-                            await progress_msg.edit_text(f"📥 Downloading... {percent}%")
+                            if percent != last_percent:
+                                last_percent = percent
+                                await progress_msg.edit_text(f"📥 Downloading... {percent}%")
                     file_path = await client.download_media(message, progress_callback=download_progress)
                     await progress_msg.edit_text("📤 Uploading to Telegram...")
                     with open(file_path, "rb") as f:
