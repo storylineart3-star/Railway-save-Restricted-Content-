@@ -172,15 +172,16 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📘 **GUIDE**\n\n"
         "1. Use /login to connect your Telegram account.\n"
-        "2. Send any public Telegram message link.\n\n"
+        "2. We only ask to login for private channel/groups content. you must be a member of private channel/group to save content.
+        "3. Send any public Telegram message link.\n\n"
         f"⚠️ **Limits:**\n"
         f"- Cooldown: {cooldown} seconds between requests\n"
-        "- Admins have no cooldown\n"
+        "- Contact: @GamingHommie if you want personal bot.\n"
         f"- File size: ≤{MAX_FILE_MB} MB → sent via bot\n"
         f"- {MAX_FILE_MB} MB – {MAX_DOWNLOAD_MB} MB → uploaded to cloud\n"
         f"- >{MAX_DOWNLOAD_MB} MB → rejected\n\n"
         "📌 **Commands:**\n"
-        "`/start` `/help` `/myinfo` `/login` `/cancel`\n\n"
+        "/start /help /myinfo /login /cancel\n\n"
         f"Messages auto‑delete after {auto_delete} seconds.",
         parse_mode="Markdown"
     )
@@ -209,13 +210,13 @@ async def myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 PHONE, CODE, PASSWORD = range(3)
 
 async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📱 Send your phone number with country code.\nExample: `+919999999999`", parse_mode="Markdown")
+    await update.message.reply_text("📱 Send your phone number with country code.\nExample: `+919999999999` This process is Secure, we don't use or save your login data. Only used to Save Restricted Content from private Channels/Groups.", parse_mode="Markdown")
     return PHONE
 
 async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     if not re.match(r'^\+\d{7,15}$', phone):
-        await update.message.reply_text("❌ Invalid phone number. Please include country code, e.g., +919999999999")
+        await update.message.reply_text("❌ Invalid phone number. Please include country code, e.g., +919999999999 & Start Again /login")
         return ConversationHandler.END
     context.user_data["phone"] = phone
 
@@ -224,13 +225,13 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await client.send_code_request(phone)
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to send code: {str(e)}")
+        await update.message.reply_text(f"❌ Failed to send code: {str(e)} Start Again /login")
         return ConversationHandler.END
 
     context.user_data["client"] = client
 
     await update.message.reply_text(
-        "🔢 Enter the OTP like: `1 2 3 4 5`\n(Spaces are optional)",
+        "🔢 Enter the OTP like: `1 2 3 4 5`\n(Spaces are MUST)",
         parse_mode="Markdown"
     )
     return CODE
@@ -238,7 +239,7 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def login_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = update.message.text.replace(" ", "")
     if not code.isdigit():
-        await update.message.reply_text("❌ Invalid OTP. Please enter numbers only (with or without spaces).")
+        await update.message.reply_text("❌ Invalid OTP. Please enter numbers only (with spaces).")
         return ConversationHandler.END
 
     client = context.user_data["client"]
@@ -247,13 +248,13 @@ async def login_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await client.sign_in(context.user_data["phone"], code)
     except PhoneCodeInvalidError:
-        await update.message.reply_text("❌ Invalid OTP. Please try again.")
+        await update.message.reply_text("❌ Invalid OTP. Please try again. click /login")
         return ConversationHandler.END
     except SessionPasswordNeededError:
         await update.message.reply_text("🔑 Enter your 2FA password:")
         return PASSWORD
     except Exception as e:
-        await update.message.reply_text(f"❌ Login failed: {str(e)}")
+        await update.message.reply_text(f"❌ Login failed: {str(e)} Start Again : /login")
         return ConversationHandler.END
 
     session = client.session.save()
@@ -276,7 +277,7 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = client.session.save()
     await save_user_session(user_id, session)
     clients[user_id] = client
-    await update.message.reply_text("✅ **Login successful!**", parse_mode="Markdown")
+    await update.message.reply_text("✅ **Login successful! Send any Link Now, You must be a member of Private Channel/Group to Save Content.**", parse_mode="Markdown")
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
