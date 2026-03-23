@@ -2,14 +2,13 @@ import os
 import re
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Optional, List
-import json
+from datetime import datetime
+from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    filters, ContextTypes, CallbackQueryHandler
+    filters, ContextTypes
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -35,14 +34,10 @@ last_used = {}  # user_id -> timestamp
 
 # ===== HELPER FUNCTIONS =====
 async def get_config(key: str, default: int) -> int:
-    """Get a configuration value from DB."""
     doc = await config_col.find_one({"_id": key})
-    if doc:
-        return doc["value"]
-    return default
+    return doc["value"] if doc else default
 
 async def set_config(key: str, value: int):
-    """Set a configuration value in DB."""
     await config_col.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
 
 async def get_cooldown() -> int:
@@ -52,7 +47,6 @@ async def get_auto_delete() -> int:
     return await get_config("auto_delete", DEFAULT_AUTO_DELETE)
 
 async def update_user(user: dict):
-    """Update user information in DB."""
     user_id = user["id"]
     now = datetime.utcnow()
     await users_col.update_one(
@@ -75,7 +69,6 @@ async def is_banned(user_id: int) -> bool:
     return user.get("is_banned", False) if user else False
 
 async def log_request(user_id: int, link: str, success: bool, error: str = None):
-    """Log a request."""
     await requests_col.insert_one({
         "user_id": user_id,
         "timestamp": datetime.utcnow(),
@@ -123,15 +116,14 @@ async def myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Username: @{user.get('username', 'N/A')}\n"
         f"First Name: {user.get('first_name', 'N/A')}\n"
         f"Requests: {user.get('request_count', 0)}\n"
-        f"Joined: {user.get('joined_at', datetime.utcnow()).strftime('%Y-%m-%d %H:%M')}\n"
-        f"Last Activity: {user.get('last_activity', datetime.utcnow()).strftime('%Y-%m-%d %H:%M')}\n"
+        f"Joined: {user['joined_at'].strftime('%Y-%m-%d %H:%M')}\n"
+        f"Last Activity: {user['last_activity'].strftime('%Y-%m-%d %H:%M')}\n"
         f"Banned: {'Yes' if user.get('is_banned') else 'No'}"
     )
     await update.message.reply_text(info, parse_mode="Markdown")
 
 # ===== ADMIN COMMANDS =====
 def admin_only(func):
-    """Decorator to restrict commands to admins."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if user_id not in ADMIN_IDS:
@@ -142,7 +134,6 @@ def admin_only(func):
 
 @admin_only
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Overall bot statistics."""
     total_users = await users_col.count_documents({})
     banned_users = await users_col.count_documents({"is_banned": True})
     total_requests = await requests_col.count_documents({})
@@ -163,14 +154,11 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List users (paginated)."""
-    # Parse page number from arguments
     page = 0
     if context.args:
         try:
             page = int(context.args[0]) - 1
-            if page < 0:
-                page = 0
+            if page < 0: page = 0
         except ValueError:
             pass
     limit = 10
@@ -187,7 +175,6 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def user_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show details of a specific user."""
     if not context.args:
         await update.message.reply_text("Usage: /user <user_id>")
         return
@@ -214,7 +201,6 @@ async def user_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ban a user."""
     if not context.args:
         await update.message.reply_text("Usage: /ban <user_id>")
         return
@@ -231,7 +217,6 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Unban a user."""
     if not context.args:
         await update.message.reply_text("Usage: /unban <user_id>")
         return
@@ -248,23 +233,20 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a broadcast message to all users."""
-    # Check if command is a reply to a message
+    # Broadcast via reply or text
     if update.message.reply_to_message:
         msg = update.message.reply_to_message
-        # Broadcast the replied message
         await update.message.reply_text("📢 Starting broadcast...")
         count = 0
         async for user in users_col.find({"is_banned": False}):
             try:
                 await msg.copy(user["user_id"])
                 count += 1
-                await asyncio.sleep(0.05)  # avoid flooding
+                await asyncio.sleep(0.05)
             except Exception as e:
                 logger.error(f"Failed to send to {user['user_id']}: {e}")
         await update.message.reply_text(f"✅ Broadcast sent to {count} users.")
     else:
-        # Get message from command arguments
         if not context.args:
             await update.message.reply_text("Usage: /broadcast <message> or reply to a message with /broadcast")
             return
@@ -282,14 +264,12 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def set_cooldown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set global cooldown in seconds."""
     if not context.args:
         await update.message.reply_text("Usage: /setcooldown <seconds>")
         return
     try:
         seconds = int(context.args[0])
-        if seconds < 1:
-            raise ValueError
+        if seconds < 1: raise ValueError
         await set_config("cooldown", seconds)
         await update.message.reply_text(f"✅ Cooldown set to {seconds} seconds.")
     except ValueError:
@@ -297,14 +277,12 @@ async def set_cooldown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def set_autodelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set global auto‑delete time in seconds."""
     if not context.args:
         await update.message.reply_text("Usage: /setautodelete <seconds>")
         return
     try:
         seconds = int(context.args[0])
-        if seconds < 1:
-            raise ValueError
+        if seconds < 1: raise ValueError
         await set_config("auto_delete", seconds)
         await update.message.reply_text(f"✅ Auto‑delete set to {seconds} seconds.")
     except ValueError:
@@ -315,33 +293,30 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
-    # Check if it's a Telegram link
     if "t.me" not in text:
         await update.message.reply_text("❌ Please send a valid Telegram message link.")
         return
 
-    # Check if user is banned
     if await is_banned(user_id):
         await update.message.reply_text("⛔ You have been banned from using this bot.")
         return
 
-    # Update user record
     await update_user(update.effective_user.to_dict())
 
-    # Cooldown (skip for admins)
+    # Cooldown
     if user_id not in ADMIN_IDS:
         cooldown = await get_cooldown()
         now = time.time()
         if user_id in last_used and now - last_used[user_id] < cooldown:
             remaining = int(cooldown - (now - last_used[user_id]))
-            await update.message.reply_text(f"⏳ Please wait {remaining} seconds before sending another link.")
+            await update.message.reply_text(f"⏳ Please wait {remaining} seconds.")
             return
         last_used[user_id] = now
 
-    # Parse link: https://t.me/username/123 or https://t.me/c/123456789/123
+    # Parse link
     match = re.search(r'https?://t\.me/(?:c/)?([^/]+)/(\d+)', text)
     if not match:
-        await update.message.reply_text("❌ Invalid link format.")
+        await update.message.reply_text("❌ Invalid link format. Use 'Copy Message Link'.")
         await log_request(user_id, text, False, "Invalid link format")
         return
 
@@ -350,26 +325,19 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Build chat identifier
     if chat_part.isdigit():
-        # Numeric ID: could be channel ID (with or without -100)
         chat_id = int(chat_part)
         if chat_id > 0:
-            # If it's a positive number, it's likely a channel without the -100 prefix
             chat_id = int(f"-100{chat_id}")
     else:
-        # Username
         chat_id = f"@{chat_part}"
 
-    # Send "working" message
     progress_msg = await update.message.reply_text("📥 Fetching message...")
-
     try:
-        # Use copyMessage to copy the message to the user
         copied = await context.bot.copy_message(
             chat_id=update.message.chat_id,
             from_chat_id=chat_id,
             message_id=message_id
         )
-        # Schedule auto‑delete of the sent message
         auto_del = await get_auto_delete()
         asyncio.create_task(auto_delete(context, copied.chat_id, copied.message_id))
         await progress_msg.delete()
@@ -392,7 +360,6 @@ async def auto_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: 
 
 # ===== MAIN =====
 def main():
-    # Create application
     app = Application.builder().token(BOT_TOKEN).build()
 
     # User commands
@@ -410,13 +377,13 @@ def main():
     app.add_handler(CommandHandler("setcooldown", set_cooldown))
     app.add_handler(CommandHandler("setautodelete", set_autodelete))
 
-    # Message handler for links
+    # Link handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
-    # Determine if webhook should be used
+    # Determine run mode
     webhook_url = os.getenv("WEBHOOK_URL")
     if webhook_url:
-        # Railway provides a public URL automatically, but you need to set it as env var
+        # Use webhook mode
         port = int(os.environ.get("PORT", 8080))
         app.run_webhook(
             listen="0.0.0.0",
@@ -425,7 +392,7 @@ def main():
             url_path=BOT_TOKEN
         )
     else:
-        # Fallback to polling (not recommended for Railway due to limited hours)
+        # Use polling mode (good for local testing)
         app.run_polling()
 
 if __name__ == "__main__":
