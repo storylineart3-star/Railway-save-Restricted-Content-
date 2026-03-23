@@ -508,7 +508,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_part = match.group(1)
     msg_id = int(match.group(2))
 
-    # Resolve entity
+    # Resolve entity – this is quick
     try:
         if chat_part.isdigit():
             entity = await client.get_entity(int(f"-100{chat_part}"))
@@ -519,22 +519,34 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_request(user_id, text, False, str(e))
         return
 
-    progress_msg = await update.message.reply_text("📥 Fetching message...")
+    # Send a "Processing" message and store its ID for later updates
+    progress_msg = await update.message.reply_text("📥 Starting...")
 
+    # Spawn background task for the actual download and send
+    asyncio.create_task(process_message(
+        update, context, user_id, text, client, entity, msg_id, progress_msg
+    ))
+
+
+async def process_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    user_id: int, link: str, client, entity, msg_id: int, progress_msg
+):
+    """Background task to fetch and deliver the message."""
     try:
         message = await client.get_messages(entity, ids=msg_id)
         if not message:
             await progress_msg.edit_text("❌ Message not found.")
-            await log_request(user_id, text, False, "Message not found")
+            await log_request(user_id, link, False, "Message not found")
             return
 
-        # Text-only message
+        # Text‑only message
         if message.text and not message.media:
             await progress_msg.delete()
             sent = await update.message.reply_text(message.text)
             auto_del = await get_auto_delete()
             asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id))
-            await log_request(user_id, text, True)
+            await log_request(user_id, link, True)
             return
 
         # Media message
@@ -546,10 +558,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await progress_msg.edit_text(
                         f"❌ File too large ({size_mb:.1f} MB).\nMax allowed: {MAX_DOWNLOAD_MB} MB."
                     )
-                    await log_request(user_id, text, False, f"File too large: {size_mb} MB")
+                    await log_request(user_id, link, False, f"File too large: {size_mb} MB")
                     return
                 elif size_mb > MAX_FILE_MB:
-                    # Upload to file.io
+                    # Upload to catbox.moe
                     await progress_msg.edit_text(f"📥 Downloading large file ({size_mb:.1f} MB)...")
                     last_percent = -1
                     async def download_progress(current, total):
@@ -560,42 +572,33 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 last_percent = percent
                                 await progress_msg.edit_text(f"📥 Downloading... {percent}%")
                     file_path = await client.download_media(message, progress_callback=download_progress)
-                    await progress_msg.edit_text("📤 Uploading to cloud...")
+                    await progress_msg.edit_text("📤 Uploading to cloud (catbox.moe)...")
                     try:
                         with open(file_path, 'rb') as f:
-                            headers = {
-                                'User-Agent': 'Mozilla/5.0 (compatible; TelegramBot/1.0)'
-                            }
-                            response = requests.post('https://file.io', files={'file': f}, headers=headers)
+                            files = {'fileToUpload': f}
+                            data = {'reqtype': 'fileupload'}
+                            response = requests.post('https://catbox.moe/user/api.php', data=data, files=files)
                         if response.status_code == 200:
-                            try:
-                                data = response.json()
-                            except ValueError:
-                                await progress_msg.edit_text(f"❌ Upload failed: Invalid response from file.io. Status: {response.status_code}\nResponse: {response.text[:200]}")
-                                await log_request(user_id, text, False, f"Upload failed: invalid JSON response")
-                                asyncio.create_task(delete_file_after(file_path, 60))
-                                return
-                            link = data.get('link')
-                            if link:
+                            link = response.text.strip()
+                            if link.startswith('http'):
                                 await progress_msg.delete()
                                 sent = await update.message.reply_text(
                                     f"✅ File uploaded to cloud:\n{link}\n\n"
-                                    "⚠️ Note: The file will be deleted after first download or in 24 hours."
+                                    "⚠️ Note: The file will be deleted after 24 hours if not accessed."
                                 )
-                                await log_request(user_id, text, True)
+                                await log_request(user_id, link, True)
                                 asyncio.create_task(delete_file_after(file_path, 60))
                                 auto_del = await get_auto_delete()
                                 asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id))
                                 return
                             else:
-                                error_msg = data.get('error', 'Unknown error')
-                                await progress_msg.edit_text(f"❌ Upload failed: {error_msg}")
+                                await progress_msg.edit_text(f"❌ Upload failed: {response.text}")
                         else:
                             await progress_msg.edit_text(f"❌ Upload failed: HTTP {response.status_code}")
-                        await log_request(user_id, text, False, f"Upload failed: HTTP {response.status_code}")
+                        await log_request(user_id, link, False, f"Upload failed: HTTP {response.status_code}")
                     except Exception as e:
                         await progress_msg.edit_text(f"❌ Upload failed: {str(e)}")
-                        await log_request(user_id, text, False, f"Upload failed: {str(e)}")
+                        await log_request(user_id, link, False, f"Upload failed: {str(e)}")
                         asyncio.create_task(delete_file_after(file_path, 60))
                         return
                 else:
@@ -624,7 +627,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     auto_del = await get_auto_delete()
                     asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id))
                     await progress_msg.delete()
-                    await log_request(user_id, text, True)
+                    await log_request(user_id, link, True)
                     return
             else:
                 # No file size info – download and send normally
@@ -643,12 +646,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 auto_del = await get_auto_delete()
                 asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id))
                 await progress_msg.delete()
-                await log_request(user_id, text, True)
+                await log_request(user_id, link, True)
                 return
     except Exception as e:
         logger.exception("Error processing message")
         await progress_msg.edit_text(f"❌ Error: {str(e)}")
-        await log_request(user_id, text, False, str(e))
+        await log_request(user_id, link, False, str(e))
 
 async def delete_file_after(file_path, delay):
     await asyncio.sleep(delay)
