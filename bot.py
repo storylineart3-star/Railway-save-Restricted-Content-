@@ -5,16 +5,15 @@ import logging
 from datetime import datetime
 from typing import Optional
 
+import aiosqlite
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes
 )
-from motor.motor_asyncio import AsyncIOMotorClient
 
 # ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else []
 DEFAULT_COOLDOWN = int(os.getenv("COOLDOWN", 10))
 DEFAULT_AUTO_DELETE = int(os.getenv("AUTO_DELETE", 300))
@@ -22,23 +21,52 @@ DEFAULT_AUTO_DELETE = int(os.getenv("AUTO_DELETE", 300))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ===== DB =====
-mongo = AsyncIOMotorClient(MONGO_URI)
-db = mongo["telegram_bot"]
-users_col = db["users"]
-requests_col = db["requests"]
-config_col = db["config"]
+# ===== DATABASE =====
+DB_PATH = "bot_data.db"
 
-# ===== MEMORY =====
-last_used = {}  # user_id -> timestamp
+async def init_db():
+    """Create tables if they don't exist."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                joined_at TEXT,
+                last_activity TEXT,
+                request_count INTEGER DEFAULT 0,
+                is_banned INTEGER DEFAULT 0
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS requests (
+                user_id INTEGER,
+                timestamp TEXT,
+                link TEXT,
+                success INTEGER,
+                error TEXT
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value INTEGER
+            )
+        ''')
+        await db.commit()
 
-# ===== HELPER FUNCTIONS =====
+# ===== CONFIG HELPERS =====
 async def get_config(key: str, default: int) -> int:
-    doc = await config_col.find_one({"_id": key})
-    return doc["value"] if doc else default
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT value FROM config WHERE key = ?', (key,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else default
 
 async def set_config(key: str, value: int):
-    await config_col.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', (key, value))
+        await db.commit()
 
 async def get_cooldown() -> int:
     return await get_config("cooldown", DEFAULT_COOLDOWN)
@@ -46,36 +74,36 @@ async def get_cooldown() -> int:
 async def get_auto_delete() -> int:
     return await get_config("auto_delete", DEFAULT_AUTO_DELETE)
 
+# ===== USER HELPERS =====
 async def update_user(user: dict):
     user_id = user["id"]
-    now = datetime.utcnow()
-    await users_col.update_one(
-        {"user_id": user_id},
-        {
-            "$set": {
-                "username": user.get("username"),
-                "first_name": user.get("first_name"),
-                "last_name": user.get("last_name"),
-                "last_activity": now,
-            },
-            "$setOnInsert": {"joined_at": now, "request_count": 0, "is_banned": False},
-            "$inc": {"request_count": 1},
-        },
-        upsert=True
-    )
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            INSERT INTO users (user_id, username, first_name, last_name, joined_at, last_activity, request_count)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name,
+                last_name = excluded.last_name,
+                last_activity = excluded.last_activity,
+                request_count = request_count + 1
+        ''', (user_id, user.get("username"), user.get("first_name"), user.get("last_name"), now, now))
+        await db.commit()
 
 async def is_banned(user_id: int) -> bool:
-    user = await users_col.find_one({"user_id": user_id})
-    return user.get("is_banned", False) if user else False
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT is_banned FROM users WHERE user_id = ?', (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return bool(row[0]) if row else False
 
 async def log_request(user_id: int, link: str, success: bool, error: str = None):
-    await requests_col.insert_one({
-        "user_id": user_id,
-        "timestamp": datetime.utcnow(),
-        "link": link,
-        "success": success,
-        "error": error
-    })
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            INSERT INTO requests (user_id, timestamp, link, success, error)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, datetime.utcnow().isoformat(), link, 1 if success else 0, error))
+        await db.commit()
 
 # ===== COMMAND HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -106,19 +134,21 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user = await users_col.find_one({"user_id": user_id})
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as cursor:
+            user = await cursor.fetchone()
     if not user:
         await update.message.reply_text("No data found. Please send a link first.")
         return
     info = (
         f"👤 **Your Info**\n"
         f"User ID: `{user_id}`\n"
-        f"Username: @{user.get('username', 'N/A')}\n"
-        f"First Name: {user.get('first_name', 'N/A')}\n"
-        f"Requests: {user.get('request_count', 0)}\n"
-        f"Joined: {user['joined_at'].strftime('%Y-%m-%d %H:%M')}\n"
-        f"Last Activity: {user['last_activity'].strftime('%Y-%m-%d %H:%M')}\n"
-        f"Banned: {'Yes' if user.get('is_banned') else 'No'}"
+        f"Username: @{user[1] or 'N/A'}\n"
+        f"First Name: {user[2] or 'N/A'}\n"
+        f"Requests: {user[6]}\n"
+        f"Joined: {user[4]}\n"
+        f"Last Activity: {user[5]}\n"
+        f"Banned: {'Yes' if user[7] else 'No'}"
     )
     await update.message.reply_text(info, parse_mode="Markdown")
 
@@ -134,11 +164,16 @@ def admin_only(func):
 
 @admin_only
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total_users = await users_col.count_documents({})
-    banned_users = await users_col.count_documents({"is_banned": True})
-    total_requests = await requests_col.count_documents({})
-    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    today_requests = await requests_col.count_documents({"timestamp": {"$gte": today}})
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT COUNT(*) FROM users') as cursor:
+            total_users = (await cursor.fetchone())[0]
+        async with db.execute('SELECT COUNT(*) FROM users WHERE is_banned = 1') as cursor:
+            banned_users = (await cursor.fetchone())[0]
+        async with db.execute('SELECT COUNT(*) FROM requests') as cursor:
+            total_requests = (await cursor.fetchone())[0]
+        today = datetime.utcnow().date().isoformat()
+        async with db.execute('SELECT COUNT(*) FROM requests WHERE date(timestamp) = ?', (today,)) as cursor:
+            today_requests = (await cursor.fetchone())[0]
     cooldown = await get_cooldown()
     auto_delete = await get_auto_delete()
     msg = (
@@ -162,14 +197,18 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pass
     limit = 10
-    cursor = users_col.find().sort("joined_at", -1).skip(page * limit).limit(limit)
-    users = await cursor.to_list(length=limit)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            'SELECT user_id, username, request_count FROM users ORDER BY joined_at DESC LIMIT ? OFFSET ?',
+            (limit, page * limit)
+        ) as cursor:
+            users = await cursor.fetchall()
     if not users:
         await update.message.reply_text("No users found.")
         return
     text = "**Users (latest first):**\n"
     for u in users:
-        text += f"• `{u['user_id']}` - @{u.get('username', 'N/A')} - {u.get('request_count',0)} reqs\n"
+        text += f"• `{u[0]}` - @{u[1] or 'N/A'} - {u[2]} reqs\n"
     text += f"\nPage {page+1}. Use `/users {page+2}` for next page."
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -183,19 +222,21 @@ async def user_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Invalid user ID.")
         return
-    user = await users_col.find_one({"user_id": user_id})
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as cursor:
+            user = await cursor.fetchone()
     if not user:
         await update.message.reply_text("User not found.")
         return
     info = (
         f"👤 **User Details**\n"
         f"User ID: `{user_id}`\n"
-        f"Username: @{user.get('username', 'N/A')}\n"
-        f"First Name: {user.get('first_name', 'N/A')}\n"
-        f"Requests: {user.get('request_count', 0)}\n"
-        f"Joined: {user['joined_at'].strftime('%Y-%m-%d %H:%M')}\n"
-        f"Last Activity: {user['last_activity'].strftime('%Y-%m-%d %H:%M')}\n"
-        f"Banned: {'Yes' if user.get('is_banned') else 'No'}"
+        f"Username: @{user[1] or 'N/A'}\n"
+        f"First Name: {user[2] or 'N/A'}\n"
+        f"Requests: {user[6]}\n"
+        f"Joined: {user[4]}\n"
+        f"Last Activity: {user[5]}\n"
+        f"Banned: {'Yes' if user[7] else 'No'}"
     )
     await update.message.reply_text(info, parse_mode="Markdown")
 
@@ -209,11 +250,10 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Invalid user ID.")
         return
-    result = await users_col.update_one({"user_id": user_id}, {"$set": {"is_banned": True}})
-    if result.modified_count:
-        await update.message.reply_text(f"✅ User {user_id} banned.")
-    else:
-        await update.message.reply_text(f"User {user_id} not found or already banned.")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('UPDATE users SET is_banned = 1 WHERE user_id = ?', (user_id,))
+        await db.commit()
+    await update.message.reply_text(f"✅ User {user_id} banned.")
 
 @admin_only
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -225,26 +265,27 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Invalid user ID.")
         return
-    result = await users_col.update_one({"user_id": user_id}, {"$set": {"is_banned": False}})
-    if result.modified_count:
-        await update.message.reply_text(f"✅ User {user_id} unbanned.")
-    else:
-        await update.message.reply_text(f"User {user_id} not found or already unbanned.")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('UPDATE users SET is_banned = 0 WHERE user_id = ?', (user_id,))
+        await db.commit()
+    await update.message.reply_text(f"✅ User {user_id} unbanned.")
 
 @admin_only
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Broadcast via reply or text
     if update.message.reply_to_message:
         msg = update.message.reply_to_message
         await update.message.reply_text("📢 Starting broadcast...")
         count = 0
-        async for user in users_col.find({"is_banned": False}):
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute('SELECT user_id FROM users WHERE is_banned = 0') as cursor:
+                users = await cursor.fetchall()
+        for (uid,) in users:
             try:
-                await msg.copy(user["user_id"])
+                await msg.copy(uid)
                 count += 1
                 await asyncio.sleep(0.05)
             except Exception as e:
-                logger.error(f"Failed to send to {user['user_id']}: {e}")
+                logger.error(f"Failed to send to {uid}: {e}")
         await update.message.reply_text(f"✅ Broadcast sent to {count} users.")
     else:
         if not context.args:
@@ -253,13 +294,16 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = " ".join(context.args)
         await update.message.reply_text("📢 Starting broadcast...")
         count = 0
-        async for user in users_col.find({"is_banned": False}):
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute('SELECT user_id FROM users WHERE is_banned = 0') as cursor:
+                users = await cursor.fetchall()
+        for (uid,) in users:
             try:
-                await context.bot.send_message(user["user_id"], text)
+                await context.bot.send_message(uid, text)
                 count += 1
                 await asyncio.sleep(0.05)
             except Exception as e:
-                logger.error(f"Failed to send to {user['user_id']}: {e}")
+                logger.error(f"Failed to send to {uid}: {e}")
         await update.message.reply_text(f"✅ Broadcast sent to {count} users.")
 
 @admin_only
@@ -289,6 +333,9 @@ async def set_autodelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid number. Please provide a positive integer.")
 
 # ===== LINK HANDLER =====
+# In‑memory cooldown storage (simple dict)
+last_used = {}
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
@@ -360,6 +407,9 @@ async def auto_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: 
 
 # ===== MAIN =====
 def main():
+    # Initialize database
+    asyncio.run(init_db())
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     # User commands
@@ -383,7 +433,6 @@ def main():
     # Determine run mode
     webhook_url = os.getenv("WEBHOOK_URL")
     if webhook_url:
-        # Use webhook mode
         port = int(os.environ.get("PORT", 8080))
         app.run_webhook(
             listen="0.0.0.0",
@@ -392,7 +441,7 @@ def main():
             url_path=BOT_TOKEN
         )
     else:
-        # Use polling mode (good for local testing)
+        # Polling (good for local testing)
         app.run_polling()
 
 if __name__ == "__main__":
