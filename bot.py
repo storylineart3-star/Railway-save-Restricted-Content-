@@ -35,7 +35,6 @@ DB_PATH = "bot_data.db"
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        # Users table
         await db.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -48,7 +47,6 @@ async def init_db():
                 is_banned INTEGER DEFAULT 0
             )
         ''')
-        # Requests log
         await db.execute('''
             CREATE TABLE IF NOT EXISTS requests (
                 user_id INTEGER,
@@ -58,14 +56,12 @@ async def init_db():
                 error TEXT
             )
         ''')
-        # Config (cooldown, auto_delete)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS config (
                 key TEXT PRIMARY KEY,
                 value INTEGER
             )
         ''')
-        # Sessions (store user sessions)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS sessions (
                 user_id INTEGER PRIMARY KEY,
@@ -136,7 +132,7 @@ async def save_user_session(user_id: int, session_string: str):
         await db.commit()
 
 # ===== TELEGRAM CLIENT MANAGEMENT =====
-clients = {}  # user_id -> TelegramClient
+clients = {}
 
 async def get_client(user_id: int) -> Optional[TelegramClient]:
     if user_id in clients:
@@ -301,7 +297,8 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         try:
             page = int(context.args[0]) - 1
-            if page < 0: page = 0
+            if page < 0:
+                page = 0
         except ValueError:
             pass
     limit = 10
@@ -421,7 +418,8 @@ async def set_cooldown(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         seconds = int(context.args[0])
-        if seconds < 1: raise ValueError
+        if seconds < 1:
+            raise ValueError
         await set_config("cooldown", seconds)
         await update.message.reply_text(f"✅ Cooldown set to {seconds} seconds.")
     except ValueError:
@@ -434,7 +432,8 @@ async def set_autodelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         seconds = int(context.args[0])
-        if seconds < 1: raise ValueError
+        if seconds < 1:
+            raise ValueError
         await set_config("auto_delete", seconds)
         await update.message.reply_text(f"✅ Auto‑delete set to {seconds} seconds.")
     except ValueError:
@@ -509,7 +508,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if message.text and not message.media:
             await progress_msg.delete()
             sent = await update.message.reply_text(message.text)
-            # Auto‑delete text message
             auto_del = await get_auto_delete()
             asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id))
             await log_request(user_id, text, True)
@@ -517,4 +515,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Media message
         if message.media:
-            file_size = message.file.size if message.
+            file_size = message.file.size if message.file else None
+            if file_size:
+                size_mb = file_size / (1024 * 1024)
+                if size_mb > MAX_DOWNLOAD_MB:
+                
