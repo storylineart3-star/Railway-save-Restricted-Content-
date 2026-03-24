@@ -1,22 +1,22 @@
 # fly.toml
-
-app = "railway-saver"                 # replace with your actual app name
+app = "railway-saver"               # your Fly.io app name
 
 [build]
+  builder = "paketobuildpacks/builder:base"
   [build.args]
     PYTHON_VERSION = "3.12"
 
 [env]
-  # Environment variables are best set via `fly secrets`.
-  # Do not hardcode tokens here.
+  # Set environment variables via `fly secrets` (do not put secrets here)
+  # Example: fly secrets set BOT_TOKEN=... API_ID=... API_HASH=...
 
 [processes]
-  web = "python bot.py"               # the command to run for the web process
+  web = "python bot.py"
 
 [[services]]
-  internal_port = 8080                # the port your bot listens on
+  internal_port = 8080
   protocol = "tcp"
-  processes = ["web"]                 # <-- this links the service to the web process
+  processes = ["web"]
 
   [services.concurrency]
     hard_limit = 25
