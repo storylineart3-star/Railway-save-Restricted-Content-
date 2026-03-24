@@ -1,0 +1,25 @@
+app = "railway-saver"
+
+[build]
+  [build.args]
+    # optional: set Python version
+    PYTHON_VERSION = "3.12"
+
+[env]
+  # environment variables can also be set here, but it's better to set them via `fly secrets`
+
+[processes]
+  web = "python bot.py"
+
+[[services]]
+  internal_port = 8080   # the port your bot listens on
+  protocol = "tcp"
+  [services.concurrency]
+    hard_limit = 25
+    soft_limit = 20
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
