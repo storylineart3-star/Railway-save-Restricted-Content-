@@ -30,7 +30,7 @@ ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("
 DEFAULT_COOLDOWN = int(os.getenv("COOLDOWN", 10))
 DEFAULT_AUTO_DELETE = int(os.getenv("AUTO_DELETE", 300))
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", 50))
-MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", 200))
+MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", 1024))   # Increased to 1 GB
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -469,6 +469,7 @@ async def set_autodelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== LINK HANDLER =====
 last_used = {}
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
@@ -562,7 +563,7 @@ async def process_message(
                     await log_request(user_id, link, False, f"File too large: {size_mb} MB")
                     return
                 elif size_mb > MAX_FILE_MB:
-                    # Upload to catbox.moe
+                    # Upload to gofile.io
                     await progress_msg.edit_text(f"📥 Downloading large file ({size_mb:.1f} MB)...")
                     last_percent = -1
                     async def download_progress(current, total):
@@ -573,19 +574,26 @@ async def process_message(
                                 last_percent = percent
                                 await progress_msg.edit_text(f"📥 Downloading... {percent}%")
                     file_path = await client.download_media(message, progress_callback=download_progress)
-                    await progress_msg.edit_text("📤 Uploading to cloud (catbox.moe)...")
+                    await progress_msg.edit_text("📤 Uploading to cloud (gofile.io)...")
                     try:
                         with open(file_path, 'rb') as f:
-                            files = {'fileToUpload': f}
-                            data = {'reqtype': 'fileupload'}
-                            response = requests.post('https://catbox.moe/user/api.php', data=data, files=files)
+                            # gofile.io API (anonymous)
+                            response = requests.post(
+                                'https://store1.gofile.io/uploadFile',
+                                files={'file': f}
+                            )
                         if response.status_code == 200:
-                            link = response.text.strip()
-                            if link.startswith('http'):
+                            data = response.json()
+                            if data.get('status') == 'ok':
+                                download_link = data['data']['downloadPage']
+                                # Some versions may return direct link in data['data']['directLink']
+                                direct_link = data['data'].get('directLink')
+                                if direct_link:
+                                    download_link = direct_link
                                 await progress_msg.delete()
                                 sent = await update.message.reply_text(
-                                    f"✅ File uploaded to cloud:\n{link}\n\n"
-                                    "⚠️ Note: The file will be deleted after 24 hours if not accessed."
+                                    f"✅ File uploaded to cloud:\n{download_link}\n\n"
+                                    "⚠️ Note: The file will be deleted after 7 days of inactivity or if not downloaded."
                                 )
                                 await log_request(user_id, link, True)
                                 asyncio.create_task(delete_file_after(file_path, 60))
@@ -593,7 +601,8 @@ async def process_message(
                                 asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id))
                                 return
                             else:
-                                await progress_msg.edit_text(f"❌ Upload failed: {response.text}")
+                                error_msg = data.get('error', 'Unknown error')
+                                await progress_msg.edit_text(f"❌ Upload failed: {error_msg}")
                         else:
                             await progress_msg.edit_text(f"❌ Upload failed: HTTP {response.status_code}")
                         await log_request(user_id, link, False, f"Upload failed: HTTP {response.status_code}")
