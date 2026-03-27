@@ -6,6 +6,7 @@ import time
 import requests
 from datetime import datetime
 from typing import Optional
+import shutil
 
 import aiosqlite
 from telegram import Update
@@ -30,7 +31,7 @@ ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("
 DEFAULT_COOLDOWN = int(os.getenv("COOLDOWN", 10))
 DEFAULT_AUTO_DELETE = int(os.getenv("AUTO_DELETE", 300))
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", 50))
-MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", 1024))   # Increased to 1 GB
+MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", 1024))   # 1 GB default
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -136,6 +137,11 @@ async def save_user_session(user_id: int, session_string: str):
         await db.execute('INSERT OR REPLACE INTO sessions (user_id, session_string) VALUES (?, ?)', (user_id, session_string))
         await db.commit()
 
+async def delete_user_session(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('DELETE FROM sessions WHERE user_id = ?', (user_id,))
+        await db.commit()
+
 # ===== TELEGRAM CLIENT MANAGEMENT =====
 clients = {}
 
@@ -150,6 +156,13 @@ async def get_client(user_id: int) -> Optional[TelegramClient]:
     clients[user_id] = client
     return client
 
+async def logout_user(user_id: int):
+    """Remove session and disconnect client."""
+    if user_id in clients:
+        await clients[user_id].disconnect()
+        del clients[user_id]
+    await delete_user_session(user_id)
+
 # ===== COMMAND HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -159,8 +172,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "This bot uses a user account to fetch messages from public channels.\n"
         "First, use /login to connect your Telegram account.\n\n"
         f"📦 **File limits:**\n"
-        f"- ≤{MAX_FILE_MB} MB: sent directly\n"
-        f"- {MAX_FILE_MB} MB – {MAX_DOWNLOAD_MB} MB: uploaded to cloud (temporary link)\n"
+        f"- ≤50 MB: sent directly\n"
+        f"- 50 MB – {MAX_DOWNLOAD_MB} MB: uploaded to cloud (temporary link)\n"
         f"- >{MAX_DOWNLOAD_MB} MB: rejected\n\n"
         "ℹ️ Use /help for full guide.",
         parse_mode="Markdown"
@@ -177,11 +190,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚠️ **Limits:**\n"
         f"- Cooldown: {cooldown} seconds between requests\n"
         "- Contact: @GamingHommie if you want personal bot.\n"
-        f"- File size: ≤{MAX_FILE_MB} MB → sent via bot\n"
-        f"- {MAX_FILE_MB} MB – {MAX_DOWNLOAD_MB} MB → uploaded to cloud\n"
+        f"- File size: ≤50 MB → sent via bot\n"
+        f"- 50 MB – {MAX_DOWNLOAD_MB} MB → uploaded to cloud\n"
         f"- >{MAX_DOWNLOAD_MB} MB → rejected\n\n"
         "📌 **Commands:**\n"
-        "/start /help /myinfo /login /cancel\n\n"
+        "/start /help /myinfo /login /logout /cancel\n\n"
         f"Messages auto‑delete after {auto_delete} seconds.",
         parse_mode="Markdown"
     )
@@ -205,6 +218,15 @@ async def myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Banned: {'Yes' if user[7] else 'No'}"
     )
     await update.message.reply_text(info, parse_mode="Markdown")
+
+async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log out the user (clear session and disconnect client)."""
+    user_id = update.effective_user.id
+    if user_id not in clients and not await get_user_session(user_id):
+        await update.message.reply_text("ℹ️ You are not logged in.")
+        return
+    await logout_user(user_id)
+    await update.message.reply_text("✅ You have been logged out. Your session is deleted.")
 
 # ===== LOGIN CONVERSATION =====
 PHONE, CODE, PASSWORD = range(3)
@@ -562,8 +584,15 @@ async def process_message(
                     )
                     await log_request(user_id, link, False, f"File too large: {size_mb} MB")
                     return
-                elif size_mb > MAX_FILE_MB:
-                    # Upload to gofile.io
+                # Use a fixed 50 MB threshold for cloud upload
+                elif size_mb > 50:
+                    # Check disk space
+                    total, used, free = shutil.disk_usage("/")
+                    if free < file_size * 2:
+                        await progress_msg.edit_text("❌ Not enough disk space to process this file.")
+                        await log_request(user_id, link, False, "Disk space error")
+                        return
+
                     await progress_msg.edit_text(f"📥 Downloading large file ({size_mb:.1f} MB)...")
                     last_percent = -1
                     async def download_progress(current, total):
@@ -575,18 +604,31 @@ async def process_message(
                                 await progress_msg.edit_text(f"📥 Downloading... {percent}%")
                     file_path = await client.download_media(message, progress_callback=download_progress)
                     await progress_msg.edit_text("📤 Uploading to cloud (gofile.io)...")
+
+                    # ---- gofile.io upload with server selection and timeout ----
                     try:
+                        # Step 1: Get upload server
+                        server_resp = requests.get('https://api.gofile.io/getServer', timeout=10)
+                        if server_resp.status_code != 200:
+                            raise Exception("Failed to get upload server")
+                        server_data = server_resp.json()
+                        if server_data.get('status') != 'ok':
+                            raise Exception(f"Server API error: {server_data.get('error', 'Unknown')}")
+                        server = server_data['data']['server']
+                        upload_url = f'https://{server}.gofile.io/uploadFile'
+
+                        # Step 2: Upload the file
                         with open(file_path, 'rb') as f:
-                            # gofile.io API (anonymous)
                             response = requests.post(
-                                'https://store1.gofile.io/uploadFile',
-                                files={'file': f}
+                                upload_url,
+                                files={'file': f},
+                                timeout=300  # 5 minutes timeout
                             )
+
                         if response.status_code == 200:
                             data = response.json()
                             if data.get('status') == 'ok':
                                 download_link = data['data']['downloadPage']
-                                # Some versions may return direct link in data['data']['directLink']
                                 direct_link = data['data'].get('directLink')
                                 if direct_link:
                                     download_link = direct_link
@@ -611,8 +653,10 @@ async def process_message(
                         await log_request(user_id, link, False, f"Upload failed: {str(e)}")
                         asyncio.create_task(delete_file_after(file_path, 60))
                         return
+                    # ---- end gofile.io upload ----
+
                 else:
-                    # Normal download and send via bot
+                    # Normal download and send via bot (≤50 MB)
                     await progress_msg.edit_text(f"📥 Downloading {size_mb:.1f} MB file...")
                     last_percent = -1
                     async def download_progress(current, total):
@@ -691,6 +735,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("myinfo", myinfo))
+    app.add_handler(CommandHandler("logout", logout))
 
     # Login conversation
     conv = ConversationHandler(
