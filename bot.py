@@ -492,7 +492,7 @@ async def set_autodelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== LINK HANDLER =====
 last_used = {}
 
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+                                            async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
@@ -603,35 +603,20 @@ async def process_message(
                                 last_percent = percent
                                 await progress_msg.edit_text(f"📥 Downloading... {percent}%")
                     file_path = await client.download_media(message, progress_callback=download_progress)
-                    await progress_msg.edit_text("📤 Uploading to cloud (gofile.io)...")
+                    await progress_msg.edit_text("📤 Uploading to cloud (anonfiles.com)...")
 
-                    # ---- gofile.io upload with server selection and timeout ----
+                    # ---- Upload to anonfiles.com ----
                     try:
-                        # Step 1: Get upload server
-                        server_resp = requests.get('https://api.gofile.io/getServer', timeout=10)
-                        if server_resp.status_code != 200:
-                            raise Exception("Failed to get upload server")
-                        server_data = server_resp.json()
-                        if server_data.get('status') != 'ok':
-                            raise Exception(f"Server API error: {server_data.get('error', 'Unknown')}")
-                        server = server_data['data']['server']
-                        upload_url = f'https://{server}.gofile.io/uploadFile'
-
-                        # Step 2: Upload the file
                         with open(file_path, 'rb') as f:
                             response = requests.post(
-                                upload_url,
+                                'https://api.anonfiles.com/upload',
                                 files={'file': f},
-                                timeout=300  # 5 minutes timeout
+                                timeout=300
                             )
-
                         if response.status_code == 200:
                             data = response.json()
-                            if data.get('status') == 'ok':
-                                download_link = data['data']['downloadPage']
-                                direct_link = data['data'].get('directLink')
-                                if direct_link:
-                                    download_link = direct_link
+                            if data.get('status', False):
+                                download_link = data['data']['file']['url']['full']
                                 await progress_msg.delete()
                                 sent = await update.message.reply_text(
                                     f"✅ File uploaded to cloud:\n{download_link}\n\n"
@@ -643,7 +628,7 @@ async def process_message(
                                 asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id))
                                 return
                             else:
-                                error_msg = data.get('error', 'Unknown error')
+                                error_msg = data.get('error', {}).get('message', 'Unknown error')
                                 await progress_msg.edit_text(f"❌ Upload failed: {error_msg}")
                         else:
                             await progress_msg.edit_text(f"❌ Upload failed: HTTP {response.status_code}")
@@ -653,7 +638,7 @@ async def process_message(
                         await log_request(user_id, link, False, f"Upload failed: {str(e)}")
                         asyncio.create_task(delete_file_after(file_path, 60))
                         return
-                    # ---- end gofile.io upload ----
+                    # ---- end anonfiles upload ----
 
                 else:
                     # Normal download and send via bot (≤50 MB)
