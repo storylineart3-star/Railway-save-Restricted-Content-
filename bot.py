@@ -30,8 +30,8 @@ API_HASH = os.getenv("API_HASH")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else []
 DEFAULT_COOLDOWN = int(os.getenv("COOLDOWN", 10))
 DEFAULT_AUTO_DELETE = int(os.getenv("AUTO_DELETE", 300))
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", 50))
-MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", 1024))   # 1 GB default
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", 50))   # not used directly, but kept for compatibility
+MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", 1024))   # 1 GB default
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -491,8 +491,7 @@ async def set_autodelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== LINK HANDLER =====
 last_used = {}
-
-                                            async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
